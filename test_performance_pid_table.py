@@ -1,13 +1,11 @@
 import math
+import os
 import threading
 import time
 import numpy as np
 import ZLAC8015D
 import D_MNSV7_X16
 from pymodbus.client.sync import ModbusSerialClient as ModbusClient
-
-max_correction = -9999.0
-min_correction = 9999.0
 
 # ===== Thông số xe =====
 wheelbase = 25.5  # cm, Khoảng cách 2 bánh xe
@@ -16,27 +14,24 @@ t1 = 0.8  # Thời gian tăng tốc để quay góc (s)
 t2 = 0.8  # Thời gian giảm tốc để quay góc (s)
 
 # ===== Cấu hình PID =====
-# Kp, Ki, Kd = 0.5852, 0.038, 6.5  # Thông số PID chính dùng cho tín hiệu analog
-# pid_table = {   # Thông số PID chính dùng cho tín hiệu analog (rpm: (Kp, Ki, Kd))
-#  0: (1.082, 0, 13.3571),
-#  5: (1.0406, 0, 12.7857),
-#  10: (0.9992, 0, 12.2143),
-#  15: (0.9578, 0, 11.6429),
-#  20: (0.9164, 0, 11.0714),
-#  25: (0.875, 0.0066, 10.5), # Không biết có nên cho Ki = 0 ko?
-#  30: (0.8336, 0.0095, 9.9286),
-#  35: (0.7922, 0.0129, 9.3571),
-#  40: (0.7508, 0.0169, 8.7857),
-#  45: (0.7094, 0.0214, 8.2143),
-#  50: (0.668, 0.0264, 7.6429),
-#  55: (0.6266, 0.0319, 7.0714),
-#  60: (0.5852, 0.038, 6.5)
-# }
+pid_table = {   # Thông số PID chính dùng cho tín hiệu analog (rpm: (Kp, Ki, Kd))
+ 0: (1.082, 0, 13.3571),
+ 5: (1.0406, 0, 12.7857),
+ 10: (0.9992, 0, 12.2143),
+ 15: (0.9578, 0, 11.6429),
+ 20: (0.9164, 0, 11.0714),
+ 25: (0.875, 0.0066, 10.5), # Không biết có nên cho Ki = 0 ko?
+ 30: (0.8336, 0.0095, 9.9286),
+ 35: (0.7922, 0.0129, 9.3571),
+ 40: (0.7508, 0.0169, 8.7857),
+ 45: (0.7094, 0.0214, 8.2143),
+ 50: (0.668, 0.0264, 7.6429),
+ 55: (0.6266, 0.0319, 7.0714),
+ 60: (0.5852, 0.038, 6.5)
+}
 Kp, Ki, Kd = pid_table.get(0)   # Lấy trước PID từ 0 rpm
 Kp_d, Kd_d = 0.2926, 7.5   # Thông số PD riêng dùng cho tín hiệu digital, ko cần I do tín hiệu ít khi có steady-state error
-# Kp, Ki, Kd = 0.875, 0, 10.5
 target = 7.5  # Vị trí trung tâm cảm biến cho tín hiệu analog
-target_d = 0  # Vị trí trung tâm cảm biến cho tín hiệu digital
 position_analog = 0  # Giá trị vị trí cho tính toán PID analog
 position_digital = 0 # Giá trị vị trí cho tính toán PID digital
 error, prevError = 0.0, 0.0
@@ -47,36 +42,34 @@ correction = 0.0 # Điều chỉnh PID
 cmds = [0, 0]  # Tốc độ điều khiển: Right rpm = cmds[0] (+), Left rpm = cmds[1] (-)
 robot_running_analog = True  # Điều khiển trạng thái robot tín hiệu analog
 robot_running_digital = False # Điều khiển trạng thái robot tín hiệu digital
-pid_interval = 0.1  # Thời gian delay điều khiển PID
+pid_interval = 0.09  # Thời gian delay điều khiển PID (0.1 -> 0.09s, do trễ từ giao diện => giảm thời gian thi hành)
 lost_line_timer = None # Biến lưu timer xử lý khi xe đi khỏi line
 timeout_duration = 0.5  # Thời gian chờ để dừng xe khi trật khỏi line
-target_speed = 60 # Biến lưu tốc độ xe cần đạt
-target_speed_reached = False # Biến lưu trạng thái thay đổi tốc độ
+current_speed_zone = 25 # Biến lưu vùng tốc độ cần đạt ( 60 or 25 rpm )
+target_speed = current_speed_zone # Biến lưu tốc độ xe cần đạt ( điều khiển tăng tốc / giảm tốc)
+# target_speed_reached = False # Biến lưu trạng thái thay đổi tốc độ
 sensor_positions = [-7.5, -6.5, -5.5, -4.5, -3.5, -2.5, -1.5, -0.5,
                      0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5]  # Dùng cho điều khiển PID bằng tín hiệu digital
 out_of_line = False
 
 # ===== Biến xử lý cho nhận diện marker =====
-
+line_pin_count = 0 # Dùng cho nhận biết ngã rẽ
+digital_value = 0 # Dùng cho nhận biết ngã rẽ
 marker_in_zone = False # Khi PID đo được sẽ ko tính toán sai số, cần cập nhật lại prevError giúp tránh giật
-#=============LOCAL MARKER_CHECK VARIAVLES================
 marker_check_count = 0 # marker "R" ( > 3 ) ,marker "L" ( < -13 ), tăng độ chính xác cho việc đọc marker bằng cách thêm giới hạn
 intersection_marker_check_count = 0 # Tương tự marker_check_count nhưng dùng cho intersection ( > 2 )
 intersection_marker_count_met = 0   # Đếm số lần đọc được marker ngã rẽ, max: 2 ( 1-in, 2-out )
 total_intersection_passed = 0   # Đếm tổng số ngã rẽ đi qua, dùng để xử lý định hướng
-line_pin_count = 0 # Dùng cho nhận biết ngã rẽ
-digital_value = 0 # Dùng cho nhận biết ngã rẽ
-current_analog_array, previous_analog_array = [], [] 
+current_analog_array, previous_analog_array = [], []
 current_digital_value, prev_digital_value = 0b0, 0b0
-#=============LOCAL MARKER_CHECK VARIAVLES================
 
 # ===== Khóa đa luồng =====
 lock_sensor = threading.Lock()  # Để tránh xung đột giữa các thread lấy dữ liệu cảm biến
 lock_motors = threading.Lock()  # Để tránh xung đột giữa các thread lấy dữ liệu từ motor
 
 # ===== Cấu hình giao tiếp Modbus =====
-client1 = ModbusClient(method='rtu', port="COM1", baudrate=115200, timeout=1)
-client2 = ModbusClient(method='rtu', port="COM2", baudrate=115200, timeout=1)
+client1 = ModbusClient(method='rtu', port="COM10", baudrate=115200, timeout=1)
+client2 = ModbusClient(method='rtu', port="COM3", baudrate=115200, timeout=1)
 
 # ===== Khởi tạo động cơ và cảm biến =====
 motors = ZLAC8015D.Controller(client1)
@@ -87,7 +80,7 @@ sensor = D_MNSV7_X16.Magnetic_Line_Sensor(client2)
 def AGV_emergency_stop():
     global cmds, robot_running_analog, robot_running_digital, lost_line_timer, out_of_line
     global Kp, Ki, Kd
-    global target_speed_reached
+    # global target_speed_reached
     if robot_running_analog or robot_running_digital:
         print("Dừng khẩn cấp xe!")
         robot_running_analog = False
@@ -98,10 +91,10 @@ def AGV_emergency_stop():
             stop_time = int((average_rpm / 60) * 1500) # ms, Tiêu chuẩn thời gian dừng cho 60 rpm là 1.5s (1500 ms)
             motors.set_decel_time(stop_time, stop_time)
             motors.stop()
-        time.sleep(2)   # Đảm bảo điều khiển PID đã được tắt
+        time.sleep(stop_time/1000 + 0.5)   # Đảm bảo điều khiển PID đã được tắt
         cmds = [0, 0]  # Reset lại tốc độ ban đầu
         Kp, Ki, Kd = pid_table.get(0)   # Cập nhật PID về ban đầu
-        target_speed_reached = False
+        # target_speed_reached = False
         print("Xe đã dừng!")
         motors.enable_motor() # Xe cần khởi động lại sau khi dừng và cần vô hiệu hóa bánh xe để thả tự do
         motors.set_accel_time(50, 50)
@@ -129,7 +122,7 @@ def AGV_emergency_stop():
 def AGV_stop_with_time(stop_time):
     global robot_running_analog, robot_running_digital, cmds
     global Kp, Ki, Kd
-    global target_speed_reached
+    # global target_speed_reached
     if robot_running_analog or robot_running_digital:
         print("Dừng xe theo thời gian!")
         robot_running_analog = False
@@ -137,10 +130,10 @@ def AGV_stop_with_time(stop_time):
         with lock_motors:
             motors.set_decel_time(stop_time, stop_time)
             motors.stop()
-        time.sleep(2)   # Đảm bảo điều khiển PID đã được tắt
+        time.sleep(stop_time/1000 + 0.5)   # Đảm bảo điều khiển PID đã được tắt
         cmds = [0, 0]  # Reset lại tốc độ ban đầu
         Kp, Ki, Kd = pid_table.get(0)  # Cập nhật PID về ban đầu
-        target_speed_reached = False
+        # target_speed_reached = False
         print("Xe đã dừng!")
         motors.enable_motor()  # Xe cần khởi động lại sau khi dừng, kết hợp với turn_angle()
         # motors.set_accel_time(50, 50)
@@ -149,70 +142,77 @@ def AGV_stop_with_time(stop_time):
         # time.sleep(0.5)
 
 # =================== HÀM KIỂM TRA LIỆU CÓ DUY NHẤT TÍN HIỆU ANALOG TỪ 1 LINE TỪ ===================
-# def has_only_1_surge_signal(arr):
-#     len_arr = len(arr)
-#     peak_index = np.argmax(arr)
+def has_only_1_surge_signal(arr):
+    len_arr = len(arr)
+    peak_index = np.argmax(arr)
 
-#     # Check increasing sequence before the peak
-#     for i in range(peak_index):
-#         if arr[i] > arr[i + 1]:
-#             return False
+    # Check increasing sequence before the peak
+    for i in range(peak_index):
+        if arr[i] > arr[i + 1]:
+            return False
 
-#     # Check decreasing sequence after the peak
-#     for i in range(peak_index, len_arr - 1):
-#         if arr[i] < arr[i + 1]:
-#             return False
+    # Check decreasing sequence after the peak
+    for i in range(peak_index, len_arr - 1):
+        if arr[i] < arr[i + 1]:
+            return False
 
-#     return True
+    return True
 # Tương tự hàm trên nhưng dùng đặc biệt cho marker
-# def has_only_1_surge_signal_marker(arr):
-#     len_arr = len(arr)
-#     peak_index = np.argmax(arr)
+def has_only_1_surge_signal_marker(arr):
+    len_arr = len(arr)
+    peak_index = np.argmax(arr)
 
-#     # Check increasing sequence before the peak
-#     for i in range(peak_index):
-#         if arr[i] > arr[i + 1]:
-#             return False, arr[peak_index]
+    # Check increasing sequence before the peak
+    for i in range(peak_index):
+        if arr[i] > arr[i + 1]:
+            return False, arr[peak_index]
 
-#     # Check decreasing sequence after the peak
-#     for i in range(peak_index, len_arr - 1):
-#         if arr[i] < arr[i + 1]:
-#             return False, arr[peak_index]
+    # Check decreasing sequence after the peak
+    for i in range(peak_index, len_arr - 1):
+        if arr[i] < arr[i + 1]:
+            return False, arr[peak_index]
 
-#     return True, arr[peak_index]
+    return True, arr[peak_index]
 
 # =================== HÀM TÍNH GIÁ TRỊ VỊ TRÍ CỦA CẢM BIẾN LINE TỪ THEO TÍN HIỆU ANALOG ===================
-# def get_position_value_analog(pin_values):
-#     # Calculate the weighted sum and total sum of sensor values
-#     weighted_sum = sum(i * value for i, value in enumerate(pin_values))
-#     total_sum = sum(pin_values)
+def get_position_value_analog(pin_values):
+    # Calculate the weighted sum and total sum of sensor values
+    weighted_sum = sum(i * value for i, value in enumerate(pin_values))
+    total_sum = sum(pin_values)
 
-#     # Avoid division by zero if no sensor is activated
-#     if total_sum == 0:
-#         return None  # No line detected
+    # Avoid division by zero if no sensor is activated
+    if total_sum == 0:
+        return None  # No line detected
 
-#     # Calculate the position as a weighted average
-#     position_value = weighted_sum / total_sum
-#     return position_value
+    # Calculate the position as a weighted average
+    position_value = weighted_sum / total_sum
+    return position_value
 
 # =================== HÀM ĐIỀU KHIỂN PID TÍN HIỆU ANALOG ===================
 def pid_controller_analog():
     global cmds, position_analog, error, prevError, d_value, i_value, correction, lost_line_timer
     global Kp, Ki, Kd
-    global marker_in_zone, target_speed_reached
+    global marker_in_zone, target_speed
     print("Start PID analog")
     while robot_running_analog:
-        start = time.perf_counter() #not dev
+        start = time.perf_counter()
+
+        # # Tăng/giảm tốc độ từ từ
+        # if not target_speed_reached:
+        #     if cmds[0] == target_speed:
+        #         target_speed_reached = True
+        #     else:
+        #         delta = 2.5 if cmds[0] < target_speed else -2.5
+        #         cmds[0] += delta
+        #         cmds[1] -= delta
+        #         Kp, Ki, Kd = pid_table.get(cmds[0], (Kp, Ki, Kd))
 
         # Tăng/giảm tốc độ từ từ
-        if not target_speed_reached:
-            if cmds[0] == target_speed:
-                target_speed_reached = True
-            else:
-                delta = 2.5 if cmds[0] < target_speed else -2.5
-                cmds[0] += delta
-                cmds[1] -= delta
-                Kp, Ki, Kd = pid_table.get(cmds[0], (Kp, Ki, Kd))
+        if cmds[0] != target_speed:
+            delta = 2.5 if cmds[0] < target_speed else -2.5
+            cmds[0] += delta
+            cmds[1] -= delta
+            Kp, Ki, Kd = pid_table.get(cmds[0], (Kp, Ki, Kd))
 
         # Chờ lock_sensor được thả từ marker_check()
         with lock_sensor:
@@ -266,13 +266,27 @@ def pid_controller_analog():
         end = time.perf_counter()
         print(end-start)
 
-        time.sleep(pid_interval)  # Thời gian delay để tránh quá tải, race giữa các thread
+        # Thời gian delay để tránh quá tải, race giữa các thread
+        time.sleep(pid_interval)
+
+        # Dừng khi hoàn thành quãng đường, giảm dần về 0 để bám line
+        if destination_reached and cmds[0] == 0:
+            with lock_motors:
+                motors.stop()
+                time.sleep(0.5)
+                Kp, Ki, Kd = pid_table.get(0)  # Cập nhật PID về ban đầu
+                motors.enable_motor()
+                turn_angle(180, 15, 'L', 2) # Quay 180 độ
+                target_speed = current_speed_zone # Cập nhật lại tốc độ cần đạt
+                break
     print("PID analog has stopped")
 
-
+# =================== HÀM CHUYỂN GIÁ TRỊ HEX VỀ 1 MẢNG 16 PHẦN TỬ SỐ NGUYÊN ===================
+def read_sensor(hex_value):
+    binary_string = format(hex_value, '016b')  # Chuyển hex sang binary
+    return [int(bit) for bit in binary_string]  # Trả về 1 mảng 16 phần tử gồm 0s và 1s
 
 # =================== HÀM TÍNH GIÁ TRỊ VỊ TRÍ CỦA CẢM BIẾN LINE TỪ THEO TÍN HIỆU DIGITAL ===================
-
 def get_position_value_digital():
     weighted_sum = 0
     active_sensors = 0
@@ -295,19 +309,25 @@ def get_position_value_digital():
 # =================== HÀM ĐIỀU KHIỂN PID TÍN HIỆU DIGITAL ===================
 def pid_controller_digital():
     global cmds, position_digital, error, prevError, d_value, correction, lost_line_timer
-    global target_speed_reached
+    # global target_speed_reached
     print("Start PID digital")
     while robot_running_digital:
         position_digital, pin_count = get_position_value_digital()
 
+        # # Tăng/giảm tốc độ từ từ
+        # if not target_speed_reached:
+        #     if cmds[0] == target_speed:
+        #         target_speed_reached = True
+        #     else:
+        #         delta = 2.5 if cmds[0] < target_speed else -2.5
+        #         cmds[0] += delta
+        #         cmds[1] -= delta
+
         # Tăng/giảm tốc độ từ từ
-        if not target_speed_reached:
-            if cmds[0] == target_speed:
-                target_speed_reached = True
-            else:
-                delta = 2.5 if cmds[0] < target_speed else -2.5
-                cmds[0] += delta
-                cmds[1] -= delta
+        if cmds[0] != target_speed:
+            delta = 2.5 if cmds[0] < target_speed else -2.5
+            cmds[0] += delta
+            cmds[1] -= delta
 
         if position_digital is None:
             print("Không tìm thấy line!")
@@ -327,7 +347,7 @@ def pid_controller_digital():
             if pin_count < 7:
 
                 # Tính toán PID
-                error = position_digital - target_d
+                error = position_digital
                 d_value = error - prevError
 
                 # Giới hạn khoảng điều khiển
@@ -352,7 +372,8 @@ def pid_controller_digital():
         with lock_motors:
             motors.set_rpm(right_speed, left_speed)
 
-        time.sleep(pid_interval)  # Thời gian delay để tránh quá tải, race giữa các thread
+        # Thời gian delay để tránh quá tải, race giữa các thread
+        time.sleep(pid_interval)
     print("PID digital has stopped")
 
 # =================== HÀM PHÁT HIỆN MARKER TỪ CẢM BIẾN detect_marker_shift ===================
@@ -371,19 +392,15 @@ def detect_marker_shift(prev, curr):
         return "C"
 
 # =================== HÀM KIỂM TRA VẠCH BÁO RẼ Ở NGÃ BA, NGÃ TƯ detect_intersection_marker() ===================
-# def count_ones(value):
-#     return bin(value).count('1')
+def count_ones(value):
+    return bin(value).count('1')
 def compute_center_of_mass(value):
     """Calculate the average position of '1's (center of mass)."""
     binary_str = format(value, '016b')
-    positions = [i for i, bit in enumerate(bi nary_str) if bit == '1']
+    positions = [i for i, bit in enumerate(binary_str) if bit == '1']
     len_pos = len(positions)
     if len_pos == 0: return None
     return sum(positions) / len_pos
-# =================== HÀM CHUYỂN GIÁ TRỊ HEX VỀ 1 MẢNG 16 PHẦN TỬ SỐ NGUYÊN ===================
-def read_sensor(hex_value):
-    binary_string = format(hex_value, '016b')  # Chuyển hex sang binary
-    return [int(bit) for bit in binary_string]  # Trả về 1 mảng 16 phần tử gồm 0s và 1s
 def detect_intersection_marker(prev, curr):
     prev_count = count_ones(prev)
     curr_count = count_ones(curr)
@@ -407,12 +424,12 @@ def detect_intersection_marker(prev, curr):
 # Note: Khi cần đi 1 quãng đường nhất định để thực hiện các tác vụ khác ( chỉ dùng cho ngã rẽ )
 def travel_distance(direction):
     global robot_running_analog, robot_running_digital, pid_thread
-    global target_speed, target_speed_reached, i_value, prevError, Kp, Ki, Kd
+    global current_speed_zone, target_speed, i_value, prevError, Kp, Ki, Kd
     global stop_turn_distance
     start_pul_r, start_pul_l = motors.get_pulses_travelled()
 
     if direction is not None:
-        if target_speed >= 40: stop_turn_distance = 37
+        if current_speed_zone == 60: stop_turn_distance = 37
         else: stop_turn_distance = 38.5
 
         while True:
@@ -429,8 +446,9 @@ def travel_distance(direction):
                 print("Tiến hành dừng và rẽ")
                 AGV_stop_with_time(stop_time) # Trạng thái PID digital và analog đã được gán False, xe đã dừng => Cần khởi động lại PID analog sau khi rẽ
                 turn_angle(90, 15, direction, 1)
-                target_speed = 25
-                target_speed_reached = False
+                current_speed_zone = 25
+                target_speed = current_speed_zone
+                # target_speed_reached = False
                 i_value = 0  # Reset giá trị tích phân về ban đầu giúp tránh tích tụ errors
                 prevError = get_position_value_analog(sensor.get_analog_output()) - target # Giảm giật lúc bắt đầu PID
                 # Kp, Ki, Kd = 0.875, 0, 10.5
@@ -453,16 +471,6 @@ def travel_distance(direction):
         if current_distance >= resume_marker_distance:
             break
         time.sleep(0.02)
-
-# =================== HÀM XỬ LÝ ĐỊNH HƯỚNG CHO NGÃ RẼ ===================
-def handle_intersection(intersection_count):
-    global robot_running_analog, robot_running_digital, pid_thread
-
-    direction = directions.get(intersection_count, None)
-    distance_thread = threading.Thread(target=travel_distance, args=(direction,))
-    distance_thread.start()
-
-    distance_thread.join()
 
 # =================== HÀM CHUYỂN HƯỚNG ROBOT ===================
 def turn_angle(angle, rpm, direction, active_wheels):
@@ -509,21 +517,54 @@ def turn_angle(angle, rpm, direction, active_wheels):
                 break
 
     motors.stop()  # Stop with deceleration time
-    time.sleep(2)
+    time.sleep(t2 + 0.5)
     motors.enable_motor()
     motors.set_accel_time(50, 50)
     motors.set_decel_time(50, 50)
     print("Khởi động lại xe sau khi rẽ...")
     time.sleep(0.5)
 
+# =================== HÀM KIỂM TRA NGÃ RẼ ===================
+def is_intersection_marker(intersect_marker_check_count):
+    if intersect_marker_check_count < 3: return False
+
+    if intersect_marker_check_count > 2 and current_speed_zone == 60:
+        return True
+    if intersect_marker_check_count > 8 and current_speed_zone == 25:
+        return True
+
+    return False
+
+# =================== HÀM XỬ LÝ ĐỊNH HƯỚNG CHO NGÃ RẼ ===================
+def handle_intersection(intersection_count):
+    global robot_running_analog, robot_running_digital, pid_thread, target_speed
+    global start_passed, destination_reached, total_intersection_passed
+
+    if not start_passed:
+        total_intersection_passed -= 1
+        start_passed = True
+        return
+    if total_intersection_passed > total_intersection_required:
+        total_intersection_passed = 0
+        target_speed = 0
+        # target_speed_reached = False
+        destination_reached = True
+        return
+
+    direction = directions.get(intersection_count, None)
+    distance_thread = threading.Thread(target=travel_distance, args=(direction,))
+    distance_thread.start()
+
+    distance_thread.join()
+
 # =================== CHƯƠNG TRÌNH KIẾM TRA MARKER TỔNG THỂ ===================
 def marker_check():
-    global Kp, Ki, Kd, i_value, prevError, target_speed, target_speed_reached, robot_running_analog, robot_running_digital, pid_thread
+    global Kp, Ki, Kd, i_value, prevError, current_speed_zone, target_speed, robot_running_analog, robot_running_digital, pid_thread
     global line_pin_count, digital_value
     global marker_check_count, intersection_marker_check_count, intersection_marker_count_met, total_intersection_passed
     global current_analog_array, previous_analog_array
     global current_digital_value, prev_digital_value
-    while not out_of_line:
+    while not out_of_line or not destination_reached:
         # start = time.perf_counter()
         try:
             with lock_sensor:
@@ -533,17 +574,17 @@ def marker_check():
                 previous_analog_array = analog_array
 
                 # Thay đổi tốc độ
-                if marker_check_count < -13: # Tăng tốc
-                    target_speed = 60
-                    target_speed_reached = False
+                if marker_check_count < -13 and current_speed_zone == 25: # Tăng tốc
+                    current_speed_zone = 60
+                    target_speed = current_speed_zone
+                    # target_speed_reached = False
                     i_value = 0 # Reset giá trị tích phân về ban đầu giúp tránh tích tụ errors
-                    # Kp, Ki, Kd = 0.5852, 0.038, 6.5
 
-                if marker_check_count > 3:   # Giảm tốc
-                    target_speed = 25
-                    target_speed_reached = False
+                if marker_check_count > 3 and current_speed_zone == 60:   # Giảm tốc
+                    current_speed_zone = 25
+                    target_speed = current_speed_zone
+                    # target_speed_reached = False
                     i_value = 0 # Reset giá trị tích phân về ban đầu giúp tránh tích tụ errors
-                    # Kp, Ki, Kd = 0.875, 0, 10.5
 
                 marker_check_count = 0 # Reset lại biến đếm marker
 
@@ -552,7 +593,7 @@ def marker_check():
                     line_pin_count, digital_value = sensor.get_pin_count()
                 if line_pin_count in [5, 6]:
                     prev_digital_value = digital_value
-                    if intersection_marker_check_count > 2: # Đã nhận diện được vạch báo ngã rẽ
+                    if is_intersection_marker(intersection_marker_check_count): # Đã nhận diện được vạch báo ngã rẽ
                         intersection_marker_count_met += 1
                         if intersection_marker_count_met >= 2:
                             if robot_running_digital:
@@ -562,10 +603,10 @@ def marker_check():
                                 pid_thread = threading.Thread(target=pid_controller_analog)  # Khởi tạo luồng PID analog
                                 pid_thread.start()
                             elif robot_running_analog:
-                                target_speed = 60
-                                target_speed_reached = False
+                                current_speed_zone = 60
+                                target_speed = current_speed_zone
+                                # target_speed_reached = False
                                 i_value = 0  # Reset giá trị tích phân về ban đầu giúp tránh tích tụ errors
-                                # Kp, Ki, Kd = 0.5852, 0.038, 6.5
 
                             intersection_marker_count_met = 0
                         else:
@@ -574,15 +615,14 @@ def marker_check():
                             handle_intersection(total_intersection_passed) # Xử lý định hướng
 
                     intersection_marker_check_count = 0 # Reset biến đếm xác nhận intersection
-                #Marker ngã rẽ    
-                elif line_pin_count > 6 and max_value > 50: 
+                elif line_pin_count > 6 and max_value > 50:
                     current_digital_value = digital_value
                     # if detect_intersection_marker(prev_digital_value, current_digital_value) and not intersection_marker_met:
                     if detect_intersection_marker(prev_digital_value, current_digital_value):
                         # intersection_marker_met = True
                         intersection_marker_check_count += 1
                         print("Intersection marker detected")
-            #có marker trái/phải
+
             elif max_value > 20: # Tránh nhiễu hoặc line quá xa tâm
                 current_analog_array = analog_array
                 marker_position = detect_marker_shift(previous_analog_array, current_analog_array)
@@ -601,39 +641,36 @@ def marker_check():
                 else:
                     print("Center marker detected, AGV oscillates too much")
 
-                # if marker_check_count > 3 and not need_speed_decreasement:
-                #     need_speed_decreasement = True
-                # elif marker_check_count < -13 and not need_speed_increasement:
-                #     need_speed_increasement = True
-
         except KeyboardInterrupt:
-            # AGV_emergency_stop()
             break
         time.sleep(0.02)
         # end = time.perf_counter()
         # print(end-start)
 
 # =================== ĐỌC FILE DẪN ĐƯỜNG ===================
-def read_direction_file(filename):
-    with open(filename, 'r') as file:
-        lines = file.readlines()
-        num_intersections = int(lines[0].strip())
-        num_directions = eval(lines[1].strip()) if len(lines) > 1 else {}
+def read_direction_file(base_path, start_num, end_num):
+    directory_path = os.path.join(base_path, str(start_num))
+    file_path = os.path.join(directory_path, f"{start_num}_{end_num}.txt")
+
+    if os.path.exists(file_path):
+        with open(file_path, 'r', encoding='utf-8') as file:
+            lines = file.readlines()
+            num_intersections = int(lines[0].strip())
+            num_directions = eval(lines[1].strip()) if len(lines) > 1 else {}
+    else:
+        print("File not found.")
     return num_intersections, num_directions
 
-# distance_threshold = 10  # Example distance threshold
-# stop_before_turn = 5  # Distance before stopping to turn
-
-# Đọc file dẫn đường
-total_intersection_required, directions = read_direction_file("1_3.txt")
+# Thư mục file dẫn đường
+directory = "E:\Food_Delivery_System\Robot_Map_Directions_2"
 
 # Các biến xử lý quãng đường đi (centimeter)
 stop_turn_distance = 37     # Quãng đường cần dừng để xoay bánh 'L'/'R'
 resume_marker_distance = 80 # Quãng đường tổng thể cần đi để tiếp tục chương trình marker_check()
 
-# =================== KHỞI TẠO CÁC THREAD ===================
-pid_thread = threading.Thread(target=pid_controller_analog)
-marker_thread = threading.Thread(target=marker_check)
+# Điểm bắt đầu và các điểm đến
+start_table = 0
+end_tables = [3, 4, 1, 2] # Minh họa điểm đến xếp theo thứ tự
 
 # ===== Kích hoạt động cơ =====
 motors.disable_motor()
@@ -642,7 +679,43 @@ motors.enable_motor()
 motors.set_accel_time(50, 50)
 motors.set_decel_time(50, 50)
 
-# Cập nhật lỗi quá khứ luôn để tránh xe giật từ lúc đầu
-prevError = get_position_value_analog(sensor.get_analog_output()) - target
-pid_thread.start()
-marker_thread.start()
+# ===== KÍCH HOẠT CHƯƠNG TRÌNH AGV GIAO ĐỒ ĂN TRONG NHÀ HÀNG =====
+num_destination = len(end_tables)
+for index in range(num_destination + 1):
+    if index == 0:
+        total_intersection_required, directions = read_direction_file(directory, start_table, end_tables[index])
+    elif index == num_destination:
+        total_intersection_required, directions = read_direction_file(directory, end_tables[index-1], start_table)
+    else:
+        total_intersection_required, directions = read_direction_file(directory, end_tables[index-1], end_tables[index])
+
+    # Khởi động biến trạng thái AGV
+    robot_running_analog = True  # Mặc định bắt đầu điều khiển tín hiệu analog
+    robot_running_digital = False
+    current_speed_zone = 25
+    target_speed = current_speed_zone
+    # target_speed_reached = False  # Biến lưu trạng thái thay đổi tốc độ
+    out_of_line = False
+
+    # Biến xác nhận điểm bắt đầu và điểm đến
+    start_passed = False
+    destination_reached = False
+
+    # =================== KHỞI TẠO CÁC THREAD ===================
+    pid_thread = threading.Thread(target=pid_controller_analog)
+    marker_thread = threading.Thread(target=marker_check)
+
+    # =================== KHỞI TẠO TÍN HIỆU ĐIỀU KHIỂN ===================
+    i_value = 0  # Tránh tích tụ lỗi
+    prevError = get_position_value_analog(sensor.get_analog_output()) - target  # Tránh giật xe
+
+    # =================== BẮT ĐẦU CÁC THREAD ===================
+    pid_thread.start()
+    marker_thread.start()
+
+    # =================== ĐỢI CÁC THREAD KẾT THÚC ===================
+    marker_thread.join()
+    pid_thread.join()
+
+    # Chờ 3 phút để khách lấy đồ trên xe xuống và tiếp tục
+    time.sleep(180)
